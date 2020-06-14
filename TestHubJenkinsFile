@@ -283,7 +283,7 @@ def getHubArchiveName(hubArtifact, hubVersion)
 	println("Getting Hub Archive Name")	
 	
 	def artifactoryUser = 'geneos-release'
-	def artifactoryAPIKey = 'AKCp5btpMPTegDizGdL32VGtWRGwUb6hBim1mxYwp25aMet54fJd14FFwFVgNvQJfkeYLKD1P'
+	def artifactoryAPIKey = 'xxxxxxxxxxxx'
 	def repo = "libs-release-local/com/itrsgroup/hub/deploy"
 	def artifactoryURL = "https://itrsgroup.jfrog.io/itrsgroup"
 	
