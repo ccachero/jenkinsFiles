@@ -1,4 +1,4 @@
-def rtServerID = "-97573564@1423141328644"
+def rtServerID = "xxxxxxxxxxxxxxx"
 def gatewayBin = ""
 def licdBin = ""
 def npLinuxBin = ""
