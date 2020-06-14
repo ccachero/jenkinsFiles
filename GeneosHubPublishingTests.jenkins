@@ -1,0 +1,83 @@
+pipeline {
+    agent {label 'PASIG'}
+    parameters {
+        string(
+            name: 'TEST_LIST',
+            defaultValue: 'Smoke', 
+            description: 'Temporary Variable')
+
+
+        string(
+            name: 'HUB_VERSION',
+            defaultValue: '1.5', 
+            description: 'Points to the hub version to be tested.')
+
+        string(
+            name: 'GENEOS_VERSION', 
+            defaultValue: '4.12.1', 
+            description: '')
+
+        string(
+            name: 'FEATURES_TO_TEST',
+            defaultValue: 'Publishing', 
+            description: 'Temporary Variable')
+            
+        string(
+            name: 'TEST_URL', 
+            defaultValue: 'git@github.com:ITRS-Group/geneos.git', 
+            description: '')
+            
+        string(
+            name: 'TEST_BRANCH', 
+            defaultValue: 'GQA-3474/hub-test-pipeline', 
+            description: '')
+	}
+    stages {
+        stage('Geneos & Hub Instances Creator') {
+            steps {
+                echo 'Checking out latest test environment...'
+                checkout([$class: 'GitSCM', branches: [[name: params.TEST_BRANCH]], doGenerateSubmoduleConfigurations: false, extensions: [], gitTool: 'Default', submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'GITHUB_DEVOPS_CREDENTIALS', url: params.TEST_URL]]])
+                
+                println("Geneos component versions: $params.GENEOS_VERSION")             
+                println("Hub version: : $params.HUB_VERSION")
+            }
+        }
+        stage('Test Run') {
+            steps {
+                echo 'Initializing test run'
+                println("Running $params.TEST_LIST tests")
+                println("Features to test: $params.FEATURES_TO_TEST")             
+                
+                //sample below how to run a docker file
+                dir('./Test/GWHub/geneos-hub-tests') {
+                    sh "docker build -t hub_tests . && docker run -i hub_tests test_run.sh $params.TEST_LIST"
+                    //sh "docker build -t hub_tests1 . && docker run -e TEST_TYPE=$params.TEST_LIST hub_tests1"
+                    //docker run -ti test /file.sh abc
+                    //sh script: "robot -d reports -i $params.TEST_LIST geneos-hub-test-project"
+                
+                }
+                echo 'Test run complete'
+            }
+        }    
+        stage('Push Results to Testrail') {
+            steps { 
+                echo 'Pushing results to testrail...'
+                echo 'Results have been pushed to testrail.'
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Job has been completed.'
+        }
+        success {
+            echo 'Test for publishing is successful.'
+        }
+        failure {
+            echo 'Test for publishing failed. Check for errors.'
+        }
+        unstable {
+            echo 'Unstable job.'
+        }
+    }
+}

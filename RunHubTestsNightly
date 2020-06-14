@@ -1,0 +1,175 @@
+/***************************************************************************************/
+/* Script Name : TestJenkinsFile                                                       */
+/* Description : This job aims to provide a way to test multiple features/plugins      */
+/*               using artifacts built previously in a separate job. You will be asked */
+/*               to provide the name of the build job and the build selector type      */
+/*               to use, as well as other trivial prerequisites listed below.          */
+/***************************************************************************************/
+
+MASTER_IP = (JENKINS_URL =~ /\/\/(.+):/)[0][1]
+PORTMAN_PORT = 5000
+
+properties([
+	parameters([
+		booleanParam(name: 'PARAMETERIZE', defaultValue: true, description: 'UNCHECK THIS. ONLY FOR JOB PARAMETERIZING IN THE FIRST RUN.'),
+
+		string(name: 'PLATFORM_ID', defaultValue: 'centos6', description: 'OS version of the node where the tests will be executed.'),
+		string(name: 'BRANCH', defaultValue: 'RTA/hub', description: 'Branch where the ats files will be pulled from.'),
+		string(name: 'ARTIFACTS_JOB_NAME', defaultValue: 'RTA_BUILD_PIPELINE', description: 'Name of the job where the gateway,netprobe and ats binaries shall be copied from.'),
+		[name: 'ARTIFACTS_JOB_SELECTOR', $class: 'BuildSelectorParameter', defaultSelector: lastSuccessful(), description: 'Job where the netprobe, gateway, ats etc will be copied from.'],
+		string(name: 'FEATURE_DIRS_TO_TEST', defaultValue: 'GWHub/E2E_publishing/MetricPublishing,GWHub/E2E_publishing/EntityStore,GWHub/E2E_publishing/EventsPublishing', description: 'Choose from the available plugin names in geneos/Test/ such as Plugins/API,Plugins/APIStreams,Netprobe/FindLatestMatchingFile/ etc.'),
+		string(name: 'TEST_LIST_NAME', defaultValue: 'testlist.txt', description: 'The filename of the testlist to look for in plugin folders.'),
+		string(name: 'TEST_JOB_NAME', defaultValue: 'GW_HUB_Integration', description: 'Pipeline job for running Test.'),
+
+		string(name: 'CREDENTIALS_FILE_ID', defaultValue: 'FETCH_EXTERNAL_CREDENTIALS', description: 'ID of credentials file used by fetch_external.'),
+		string(name: 'GIT_URL', defaultValue: 'git@github.com:ITRS-Group/geneos.git', description: 'Git url from which ats files will be pulled from.'),
+		string(name: 'GIT_CREDENTIALS_ID', defaultValue: 'GITHUB_DEVOPS_CREDENTIALS', description: 'ID of git credentials used in checking out ats files.'),
+
+		booleanParam(name: 'CLEANUP_WORKSPACE', defaultValue: true, description: 'Flag to clean up workspace after execution.'),
+		booleanParam(name: 'UNIQUE_WORKSPACE', defaultValue: true, description: 'Use unique workspace for each build.'),
+		string(name: 'HUB_URL', defaultValue: 'qa-hub-mla1.qa.mlg.itrs', description: 'Use this HUB instance instead of setting up a new instance. Separate instances by comma (,)'),
+		string(name: 'HUB_PORT', defaultValue: '9092', description: 'Specify the Port of Hub Instance if other than 9092'),
+		string(name: 'HUB_REST_ADDRESS_PORT', defaultValue: '8080', description: 'Specify the REST Address Port if other than 8080'),
+		string(name: 'HUB_REST_IP_ADDRESS', defaultValue: '192.168.39.111', description: 'The IP Addressess of the HUB_URL. Separate instances by comma (,) '),
+		
+	]),
+	pipelineTriggers([
+		cron('''TZ=Asia/Manila \n30 23 * * *''')
+	])
+])
+
+def getJobTrigger()
+{
+    def timerCause = currentBuild.rawBuild.getCause(hudson.triggers.TimerTrigger.TimerTriggerCause)
+    def userCause = currentBuild.rawBuild.getCause(hudson.model.Cause.UserIdCause.class)
+
+    if (timerCause != null)
+    {
+        return "TIMER"
+    }
+    else if (userCause != null)
+    {
+        return "USER"
+    }
+    else
+    {
+		currentBuild.displayName = "UNKNOWN JOB TRIGGER"
+		currentBuild.result = 'ABORTED'
+		error('JOB TRIGGER NOT SUPPORTED.')
+    }
+}
+
+def getBuildUser()
+{
+	wrap([$class: 'BuildUser']) {
+		if (env.BUILD_USER_ID?.trim())
+		{
+			return env.BUILD_USER_ID.substring(env.BUILD_USER_ID.indexOf("\\")+1)
+		}
+		return "auto-jenkins"
+	}
+}
+
+def getBuildJobNumber()
+{
+	def job = Jenkins.instance.getItem(params.ARTIFACTS_JOB_NAME)
+	def jobNumber = job.getLastCompletedBuild().getNumber()
+
+	return jobNumber.toString()
+}
+
+def testProper(testList, testJobName, jobSelector)
+{
+	def testSystems = params.PLATFORM_ID.split(',')
+	def testJobs = [:]
+
+
+	for (idx = 0; idx < testSystems.size(); idx++)
+	{
+		def testSystem = testSystems[idx]
+
+			testJobs[testSystem] = {
+			stage ("Running Test Job")
+			{
+				build job: testJobName,
+				parameters:
+				[
+					booleanParam(name: 'PARAMETERIZE', value: false),
+					string(name: 'PLATFORM_ID', value: testSystem),
+					string(name: 'BRANCH', value: params.BRANCH),
+					string(name: 'ARTIFACTS_JOB_NAME', value: params.ARTIFACTS_JOB_NAME),
+					string(name: 'ARTIFACTS_JOB_SELECTOR', value: jobSelector),
+					string(name: 'FEATURE_DIRS_TO_TEST', value: params.FEATURE_DIRS_TO_TEST),
+					string(name: 'TEST_LIST_NAME', value: testList),
+					string(name: 'CREDENTIALS_FILE_ID', value: params.CREDENTIALS_FILE_ID),
+					string(name: 'GIT_URL', value: params.GIT_URL),
+					string(name: 'GIT_CREDENTIALS_ID', value: params.GIT_CREDENTIALS_ID),
+					string(name: 'HUB_URL', value: params.HUB_URL),
+					string(name: 'HUB_PORT', value: params.HUB_PORT),
+					string(name: 'HUB_REST_ADDRESS_PORT', value: params.HUB_REST_ADDRESS_PORT),
+					booleanParam(name: 'UNIQUE_WORKSPACE', value: true),
+					booleanParam(name: 'CLEANUP_WORKSPACE', value: params.CLEANUP_WORKSPACE)
+				]
+			}
+		}
+	}
+	parallel testJobs
+}
+
+node(PLATFORM_ID)
+{
+	timestamps
+	{
+		BUILD_USER_ID = getBuildUser()
+		JOB_TRIGGER = getJobTrigger()
+
+		ws ("${workspace}/${BUILD_USER_ID}/${BUILD_NUMBER}")
+		{
+			def buildJobNumber = ''
+			def jobSelector = ''
+			def testList = ''
+			def testJobName = ''
+			def lastBuildNumber = getBuildJobNumber()
+
+
+			if (JOB_TRIGGER == 'USER')
+			{
+				currentBuild.displayName = "User Run"
+				currentBuild.description = "Using <b>${params.TEST_JOB_NAME}</b> <br> <b>PLATFORMS:</b> ${params.OS_TO_TEST} <br> <b>TESTLIST:</b> ${params.TEST_LIST_NAME}"
+
+						stage ("Test")
+						{
+							testList = params.TEST_LIST_NAME
+							testJobName = params.TEST_JOB_NAME
+							jobSelector = "<SpecificBuildSelector><buildNumber>${lastBuildNumber}</buildNumber></SpecificBuildSelector>"
+
+								testProper(testList, testJobName, jobSelector)
+
+						}
+			}
+			else if (JOB_TRIGGER == 'TIMER') 
+			{
+				currentBuild.displayName = "Nightly Run"
+				currentBuild.description = "Using <b>${params.TEST_JOB_NAME}</b> <br> <b>PLATFORMS:</b> ${params.OS_TO_TEST} <br> <b>TESTLIST:</b> ${params.TEST_LIST_NAME}"
+
+						stage ("Test")
+						{
+							testList = params.TEST_LIST_NAME
+							testJobName = params.TEST_JOB_NAME
+							jobSelector = "<SpecificBuildSelector><buildNumber>${lastBuildNumber}</buildNumber></SpecificBuildSelector>"
+
+								testProper(testList, testJobName, jobSelector)
+
+						}
+			}
+
+			if (params.CLEANUP_WORKSPACE == true)
+			{
+				stage ("Cleanup")
+				{
+					deleteDir() 
+				}
+			}
+		}
+	}
+}

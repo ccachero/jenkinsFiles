@@ -1,0 +1,1289 @@
+/***************************************************************************************/
+/* Script Name : TestJenkinsFile                                                       */
+/* Description : This job aims to provide a way to test multiple features/plugins      */
+/*               using artifacts built previously in a separate job. You will be asked */
+/*               to provide the name of the build job and the build selector type      */
+/*               to use, as well as other trivial prerequisites listed below.          */
+/***************************************************************************************/
+
+MASTER_IP = (JENKINS_URL =~ /\/\/(.+):/)[0][1]
+PORTMAN_PORT = 5000
+
+properties([
+	parameters([
+		booleanParam(name: 'PARAMETERIZE', defaultValue: true, description: 'UNCHECK THIS. ONLY FOR JOB PARAMETERIZING IN THE FIRST RUN.'),
+
+		string(name: 'PLATFORM_ID', defaultValue: 'centos6', description: 'OS version of the node where the tests will be executed.'),
+		string(name: 'BRANCH', defaultValue: 'RTA/hub', description: 'Branch where the ats files will be pulled from.'),
+		string(name: 'ARTIFACTS_JOB_NAME', defaultValue: 'SITT_BUILD_FROM_SHARED', description: 'Name of the job where the gateway,netprobe and ats binaries shall be copied from.'),
+		[name: 'ARTIFACTS_JOB_SELECTOR', $class: 'BuildSelectorParameter', defaultSelector: lastSuccessful(), description: 'Job where the netprobe, gateway, ats etc will be copied from.'],
+		string(name: 'FEATURE_DIRS_TO_TEST', defaultValue: 'GWHub/E2E_publishing/MetricPublishing', description: 'Choose from the available plugin names in geneos/Test/ such as Plugins/API,Plugins/APIStreams,Netprobe/FindLatestMatchingFile/ etc.'),
+		string(name: 'TEST_LIST_NAME', defaultValue: 'testlist.txt', description: 'The filename of the testlist to look for in plugin folders.'),
+
+		string(name: 'CREDENTIALS_FILE_ID', defaultValue: 'FETCH_EXTERNAL_CREDENTIALS', description: 'ID of credentials file used by fetch_external.'),
+		string(name: 'GIT_URL', defaultValue: 'git@github.com:ITRS-Group/geneos.git', description: 'Git url from which ats files will be pulled from.'),
+		string(name: 'GIT_CREDENTIALS_ID', defaultValue: 'GITHUB_DEVOPS_CREDENTIALS', description: 'ID of git credentials used in checking out ats files.'),
+
+		booleanParam(name: 'CLEANUP_WORKSPACE', defaultValue: true, description: 'Flag to clean up workspace after execution.'),
+		booleanParam(name: 'UNIQUE_WORKSPACE', defaultValue: true, description: 'Use unique workspace for each build.'),
+		string(name: 'HUB_URL', defaultValue: 'qa-hub-mla1.qa.mlg.itrs', description: 'Use this HUB instance instead of setting up a new instance. Separate instances by comma (,)\nDefaults to Malaga Hub qa-hub-mla1.qa.mlg.itrs '),
+		string(name: 'HUB_REST_IP_ADDRESS', defaultValue: '192.168.39.111', description: 'The IP Addressess of the HUB_URL. Separate instances by comma (,) '),
+
+		string(name: 'HUB_PORT', defaultValue: '9092', description: 'Specify the Port of Hub Instance if other than 9092'),
+		string(name: 'HUB_REST_ADDRESS_PORT', defaultValue: '8080', description: 'Specify the REST Address Port if other than 8080'),
+
+		//We will defer the deployment procedure for now and assume a Hub instance.
+		//booleanParam(name: 'DEPLOY_HUB', defaultValue:false, description: 'Deploy a new Hub instance in AWS'),
+		//string(name: 'HUB_VERSION', defaultValue: '1.2', description: 'Hub version to execute'),
+		
+	])
+])
+
+script 
+{
+	if (params.PARAMETERIZE == true) {
+		currentBuild.result = 'ABORTED'
+		currentBuild.displayName = "JOB PARAMETERIZATION"
+		error('DRY RUN COMPLETED. JOB PARAMETERIZED.')
+	} else {
+		println('JOB ALREADY PARAMETERIZED.')
+	}
+
+	node('master')
+	{
+		println('Checking Port Manager Status...')
+		lock ('port-mgmt')
+		{
+			if (!isPortManagerUp())
+			{
+				println('Port Manager is not running. Starting...')
+				try
+				{
+					sh (script: """
+						whoami
+						cd ${JENKINS_HOME}/PortManager
+						JENKINS_NODE_COOKIE=dontKillMe ./startPortManager.sh
+						sleep 15
+					""", returnStdout: true)
+				}
+				catch (err)
+				{
+					println('Unable to start Port Manager. ' + err.getMessage())
+				}
+				finally
+				{
+					if (!isPortManagerUp())
+					{
+						currentBuild.result = 'ABORTED'
+						error('PORT MANAGER IS DOWN!!!')
+					}
+					else
+					{
+						println('Port Manager has been started successfully!')
+					}
+				}
+			}
+			else
+			{
+				println('Port Manager is running...')
+			}
+		}
+	}
+}
+
+TEST_CONFIG = [
+	'centos5'      :  [
+		'run_node'  : 'centos5',
+		'gw_platform' : 'linux_64',
+		'np_platform' : 'linux_64',
+		'artifacts' : [	"**/geneos-netprobe*linux-x64.tar.gz", 
+						"**/geneos-gateway*linux-x64.tar.gz", 
+						"**/geneos-ats-*.linux-x64.tar.gz",
+						"**/geneos-fix-analyser2-netprobe*linux-x64.tar.gz", 
+						"**/geneos-file-agent*linux-x64.tar.gz", 
+						"**/*linux-x64-NETPROBE*.tar.gz", 
+						"**/*linux-x64-GATEWAY*.tar.gz",
+						"**/geneos-*.linux-x64-ATS.tar.gz"
+					]
+	], 
+	'centos6'      :  [
+		'run_node'  : 'centos6',
+		'gw_platform' : 'linux_64',
+		'np_platform' : 'linux_64',
+		'artifacts' : [	"**/geneos-netprobe*linux-x64.tar.gz", 
+						"**/geneos-gateway*linux-x64.tar.gz", 
+						"**/geneos-ats-*.linux-x64.tar.gz",
+						"**/geneos-fix-analyser2-netprobe*linux-x64.tar.gz", 
+						"**/geneos-file-agent*linux-x64.tar.gz", 
+						"**/*linux-x64-NETPROBE*.tar.gz", 
+						"**/*linux-x64-GATEWAY*.tar.gz",
+						"**/geneos-*.linux-x64-ATS.tar.gz"
+					]
+	],
+	'centos7'      :  [
+		'run_node'  : 'centos7',
+		'gw_platform' : 'linux_64',
+		'np_platform' : 'linux_64',
+		'artifacts' : [	"**/geneos-netprobe*linux-x64.tar.gz", 
+						"**/geneos-gateway*linux-x64.tar.gz", 
+						"**/geneos-ats-*.linux-x64.tar.gz",
+						"**/geneos-fix-analyser2-netprobe*linux-x64.tar.gz", 
+						"**/geneos-file-agent*linux-x64.tar.gz", 
+						"**/*linux-x64-NETPROBE*.tar.gz", 
+						"**/*linux-x64-GATEWAY*.tar.gz",
+						"**/geneos-*.linux-x64-ATS.tar.gz"
+					]
+	]
+]
+
+DEFAULT_ENV_MAP = [:]
+DEFAULT_ENV_ARRAY = [:]
+
+RUN_NODE = TEST_CONFIG[params.PLATFORM_ID]['run_node']
+NODE_WORKSPACE = ''
+BUILD_USER_ID = ''
+REMOTE_TEST_DIR = ''
+IS_REMOTE_MACHINE = false
+
+
+def getRemoteDrive()
+{
+    def PLATFORM_ID_UPPER = params.PLATFORM_ID.toUpperCase()
+    return env."${PLATFORM_ID_UPPER}_NP_REMOTE_DRIVE"
+}
+
+def getRemoteHost()
+{
+    def PLATFORM_ID_UPPER = params.PLATFORM_ID.toUpperCase()
+    return env."${PLATFORM_ID_UPPER}_NP_REMOTE_HOST"
+}
+
+def getVersion()
+{
+	def version = readFile("${NODE_WORKSPACE}/geneos/Source/version.txt").trim()
+
+	return version
+}
+
+def getHubVersion()
+{
+	return params.HUB_VERSION
+}
+
+def initDefaultEnvironment()
+{
+	// Build the environment map.
+	DEFAULT_ENV_MAP.put("PLATFORM_ID", params.PLATFORM_ID)
+	DEFAULT_ENV_MAP.put("NODE_WORKSPACE", NODE_WORKSPACE)
+	DEFAULT_ENV_MAP.put("TEST_LIST_NAME", params.TEST_LIST_NAME)
+	DEFAULT_ENV_MAP.put("PATH", "$PATH:/sbin:/usr/ucb")
+	DEFAULT_ENV_MAP.put("GW_DIR", "${NODE_WORKSPACE}/gateway")
+	DEFAULT_ENV_MAP.put("NP_DIR", "${NODE_WORKSPACE}/netprobe")
+	DEFAULT_ENV_MAP.put("PLUGIN_ATS_DIR", "${NODE_WORKSPACE}/ats")
+	DEFAULT_ENV_MAP.put("TEST_PATH", "${NODE_WORKSPACE}/geneos/Test")
+	DEFAULT_ENV_MAP.put("ATS_TEST_DIR_TEMP", "${NODE_WORKSPACE}/geneos/Test")
+	DEFAULT_ENV_MAP.put("JAVA_HOME_TEMP", "${env.JAVA_HOME}")
+	DEFAULT_ENV_MAP.put("HELPERS_DIR", "${NODE_WORKSPACE}/geneos/Test/Plugins/Helpers")
+	DEFAULT_ENV_MAP.put("ATS_PLATFORM", TEST_CONFIG[params.PLATFORM_ID]['gw_platform'])
+	DEFAULT_ENV_MAP.put("NP_PLATFORM", TEST_CONFIG[params.PLATFORM_ID]['np_platform'])
+	DEFAULT_ENV_MAP.put("GW_PLATFORM", TEST_CONFIG[params.PLATFORM_ID]['gw_platform'])
+	DEFAULT_ENV_MAP.put("GW_HUB_URL", params.HUB_URL)
+	DEFAULT_ENV_MAP.put("GW_HUB_IP_ADDRESS", params.HUB_REST_IP_ADDRESS)
+
+	DEFAULT_ENV_MAP.put("GW_HUB_PORT", params.HUB_PORT)
+	DEFAULT_ENV_MAP.put("GW_HUB_REST_ADDRESS_PORT", params.HUB_REST_ADDRESS_PORT)
+	
+	
+	// Will be reliant on the node where the pipeline will run.
+	DEFAULT_ENV_MAP.put('NP_REMOTE_HOST', getRemoteHost())
+
+	// The following commented environments are also being set somewhere below.
+	// DEFAULT_ENV_MAP.put("ATS_TESTAREA_TEMP", "")
+	// DEFAULT_ENV_MAP.put("RUN_LOG_DIR_TEMP", "")
+	//DEFAULT_ENV_MAP.put('NP_REMOTE_FOLDER', "${env.WIN_NP_REMOTE_DRIVE}:${JOB_NAME}/${BUILD_USER_ID}/${BUILD_NUMBER}")
+	//DEFAULT_ENV_MAP.put('NP_REMOTE_FOLDER', "${env.AIX_NP_REMOTE_DRIVE}/${JOB_NAME}/${BUILD_USER_ID}/${BUILD_NUMBER}")
+	//DEFAULT_ENV_MAP.put('NP_REMOTE_FOLDER', "${env.PPC_NP_REMOTE_DRIVE}/${JOB_NAME}/${BUILD_USER_ID}/${BUILD_NUMBER}")
+
+	// Why though? 2 reasons.
+	// 1). withEnv() accepts string array.
+	// 2). In the future we might want to replace an env on specific stages, steps etc.
+	//     A map is easier to manipulate.
+	DEFAULT_ENV_ARRAY = buildEnvArrayFromMap(DEFAULT_ENV_MAP)
+}
+
+def buildEnvArrayFromMap(envMap)
+{
+	def envList = []
+
+	println("DEFAULT_ENV_MAP CONTENT: ")
+
+	envMap.each {
+		env_key, env_value ->
+		def keyValueString = "${env_key}=${env_value}"
+		envList.add(keyValueString)
+		println(keyValueString)
+	}
+
+	return envList
+}
+
+def getBinaryPlatform(component)
+{
+
+	def PLATFORM = TEST_CONFIG[params.PLATFORM_ID]["${component}_platform"]
+
+	if((PLATFORM.startsWith('linux') || PLATFORM.startsWith('windows') || PLATFORM.startsWith('aix')) && (component != "np"))
+			return 'linux-x64'
+	if((PLATFORM == "linux_64") && (component == "np"))
+			return 'linux-x64'
+	if((PLATFORM.startsWith('windows')) && (component == "np"))
+			return 'windows-x64'
+	if((PLATFORM.startsWith('aix')) && (component == "np"))
+			return 'aix-ppc64'
+	if((PLATFORM.startsWith('linuxppc')) && (component == "np"))
+			return 'linux-ppc64le'
+	if((PLATFORM == 'sunx86_64'))
+			return 'solaris-x64'
+	if((PLATFORM == 'sun_64'))
+			return 'solaris-sparc64'
+	else if((PLATFORM == 'sun'))
+			return 'solaris-sparc'
+}
+
+def getATSArchiveName(version)
+{
+	def ATS_BINARY_PLATFORM = getBinaryPlatform("gw")
+
+	return "geneos-ats-${version}.${ATS_BINARY_PLATFORM}.tar.gz"
+}
+
+def getGWArchiveName(version)
+{
+	def GW_BINARY_PLATFORM = getBinaryPlatform("gw")
+
+	return "geneos-gateway-${version}.${GW_BINARY_PLATFORM}.tar.gz"
+}
+
+def getNPArchiveName(version)
+{
+	def NP_BINARY_PLATFORM = getBinaryPlatform("np")
+
+	if(NP_BINARY_PLATFORM == "windows-x64")
+	{
+		return "geneos-netprobe-${version}.${NP_BINARY_PLATFORM}.zip"
+	}
+	else
+	{
+		return "geneos-netprobe-${version}.${NP_BINARY_PLATFORM}.tar.gz"
+	}
+}
+
+def getHubArchiveName(hubArtifact, hubVersion)
+{
+	println("Getting Hub Archive Name")	
+	
+	def artifactoryUser = 'geneos-release'
+	def artifactoryAPIKey = 'AKCp5btpMPTegDizGdL32VGtWRGwUb6hBim1mxYwp25aMet54fJd14FFwFVgNvQJfkeYLKD1P'
+	def repo = "libs-release-local/com/itrsgroup/hub/deploy"
+	def artifactoryURL = "https://itrsgroup.jfrog.io/itrsgroup"
+	
+	def HUB_BINARY_NAME = sh(returnStdout: true, script: "curl -s -k -u ${artifactoryUser}:${artifactoryAPIKey} ${artifactoryURL}/${repo}/?lastModified? | grep -i ${hubArtifact}-${hubVersion} | tail -1 | sed -e :a -e 's/<[^>]*>//g;/</N;//ba' -e 's/\\.gz.*/.gz/'")
+	
+	return HUB_BINARY_NAME
+}
+
+def getGatewayExportPorts(featureDir)
+{
+	def gwExpNum = 0
+	def PLATFORM = TEST_CONFIG[params.PLATFORM_ID]["gw_platform"]
+
+	try 
+	{
+		if((PLATFORM.startsWith('sun')))
+		{
+			gwExpNum = sh(returnStdout: true, script: "nawk -F' ' '{print gsub(/ATS_GW_PORT/,\"\")}' `find ${NODE_WORKSPACE}/geneos/Test/${featureDir} -name ${TEST_LIST_NAME}` | sort | tail -1").trim().toInteger()
+		}
+		else
+		{
+			gwExpNum = sh(returnStdout: true, script: "awk -F' ' '{print gsub(/ATS_GW_PORT/,\"\")}' `find ${NODE_WORKSPACE}/geneos/Test/${featureDir} -name ${TEST_LIST_NAME}` | sort | tail -n1").trim().toInteger()
+		}
+	} 
+	catch(err)
+	{
+		println(err.getMessage())
+		gwExpNum = 0
+	}
+	
+	return gwExpNum
+}
+
+def getSetupTypes()
+{
+	return [
+		default        : [ netprobeCount: 1, gatewayCount: 1], 
+		nprobes_0      : [ netprobeCount: 0, gatewayCount: 1],
+		nprobes_1      : [ netprobeCount: 1, gatewayCount: 1],
+		nprobes_2      : [ netprobeCount: 2, gatewayCount: 1],
+		nprobes_3      : [ netprobeCount: 3, gatewayCount: 1],
+		nprobes_4      : [ netprobeCount: 4, gatewayCount: 1],
+		nprobes_8      : [ netprobeCount: 8, gatewayCount: 1],
+		nprobes_10     : [ netprobeCount: 10, gatewayCount: 1],
+		secondary_gw   : [ netprobeCount: 1, gatewayCount: 2],
+		secondary_gw_1 : [ netprobeCount: 1, gatewayCount: 2],
+		secondary_gw_2 : [ netprobeCount: 2, gatewayCount: 2],
+		secondary_gw_3 : [ netprobeCount: 3, gatewayCount: 2]
+	]
+}
+
+def getTestlistConfigs(featureDir)
+{
+	def testListConfigs = [:]
+
+	try 
+	{
+		testListConfigs = sh(script: "find '${NODE_WORKSPACE}/geneos/Test/${featureDir}' -name '${TEST_LIST_NAME}' -exec awk '{print \$1}' {} + | egrep 'nprobes_|secondary_|default' | sort | uniq | xargs", returnStdout: true).trim().tokenize(' ')
+	}
+	catch(err)
+	{
+		println("Unable to read testlist. " + err.getMessage())
+	}
+
+	return testListConfigs
+}
+
+def getMaxProbeCount(featureDir)
+{
+	def setupType = getSetupTypes()
+	def maxProbeCount = 1
+
+	withEnv(DEFAULT_ENV_ARRAY)
+	{
+		def configs = getTestlistConfigs(featureDir) 
+
+		println("Testlist configs: " + configs)
+		configs.each {
+			config ->
+
+			if (setupType[config] != null)
+			{
+				def currentProbeCount = setupType[config].netprobeCount
+
+				if (currentProbeCount > maxProbeCount)
+					maxProbeCount = currentProbeCount
+			}
+		}
+	}
+	return maxProbeCount
+}
+
+def fetchFeatureDirExternals(featureDir)
+{
+	configFileProvider([configFile(fileId: params.CREDENTIALS_FILE_ID, variable: 'CREDENTIALS_FILE')]) {
+		withEnv(DEFAULT_ENV_ARRAY)
+		{
+			sh("""
+					if [ -d "\${NODE_WORKSPACE}/geneos/Test/${featureDir}/externals" ]; then
+							cd \${NODE_WORKSPACE}/geneos/Test/${featureDir}/externals
+							python \${NODE_WORKSPACE}/geneos/Source/.build-utils/fetch_externals.py \${NP_PLATFORM}
+
+							JARS_ONLY=1
+							export JARS_ONLY
+							python \${NODE_WORKSPACE}/geneos/Source/.build-utils/fetch_externals.py \${NP_PLATFORM}
+					fi
+			""")
+		}
+	}
+}
+
+def fetchHelpersExternals()
+{
+	configFileProvider([configFile(fileId: params.CREDENTIALS_FILE_ID, variable: 'CREDENTIALS_FILE')]) {
+		withEnv(DEFAULT_ENV_ARRAY)
+		{
+			println ("HELPERS_DIR    : ${HELPERS_DIR}")
+			println ("NODE_WORKSPACE : ${NODE_WORKSPACE}")
+			println ("NP_PLATFORM    : ${NP_PLATFORM}")
+			println ("GW_PLATFORM    : ${GW_PLATFORM}")
+
+			sh('''
+					cd ${HELPERS_DIR}
+					unset JARS_ONLY
+					for d in * ; do
+						if [ -d "${d}/externals" ]; then
+							cd ${d}/externals
+							python ${NODE_WORKSPACE}/geneos/Source/.build-utils/fetch_externals.py ${NP_PLATFORM}
+							python ${NODE_WORKSPACE}/geneos/Source/.build-utils/fetch_externals.py ${GW_PLATFORM}
+							cd ../..
+						fi
+					done
+			''')
+		}
+	}
+}
+
+def downloadAtsBinary()
+{
+	def ATS_BINARY_NAME = getATSArchiveName()
+	def ATS_PATH_PLATFORM = TEST_CONFIG[params.PLATFORM_ID]['gw_platform']
+	sh ("wget http://mndev002/build/ats/${ATS_PATH_PLATFORM}/${ATS_BINARY_NAME}")
+}
+
+def downloadArtifacts()
+{
+	def artifacts = TEST_CONFIG[params.PLATFORM_ID]['artifacts']
+	def artifactCount = 0;
+	
+	// Download NP and GW artifacts.
+	artifacts.each {
+		artifact ->
+
+		try
+		{
+			copyArtifacts(
+				filter: artifact,
+				fingerprintArtifacts: true,
+				projectName: params.ARTIFACTS_JOB_NAME,
+				selector: buildParameter('ARTIFACTS_JOB_SELECTOR'),
+				flatten: true)
+			artifactCount++;
+		} catch (err) {
+			println("Unable to copy any artifact with the pattern ${artifact}.")
+		}
+	}
+	return artifactCount;
+}
+
+def downloadATSFromSharedDrive(version)
+{
+	def ATS_BINARY_NAME = getATSArchiveName(version)
+	def ATS_PATH_PLATFORM = TEST_CONFIG[params.PLATFORM_ID]['gw_platform']
+	return (sh ("wget http://mndev002/build/ats/${ATS_PATH_PLATFORM}/${ATS_BINARY_NAME}"))
+}
+
+def downloadNPFromSharedDrive(version)
+{
+	def NP_BINARY_NAME = getNPArchiveName(version)
+	def NP_PATH_PLATFORM = TEST_CONFIG[params.PLATFORM_ID]['np_platform']
+	return (sh ("wget http://mndev002/build/netprobe/${NP_PATH_PLATFORM}/${NP_BINARY_NAME}"))
+}
+
+def downloadGWFromSharedDrive(version)
+{
+	def GW_BINARY_NAME = getGWArchiveName(version)
+	def GW_PATH_PLATFORM = TEST_CONFIG[params.PLATFORM_ID]['gw_platform']
+	return (sh ("wget http://mndev002/build/gateway2/${GW_PATH_PLATFORM}/${GW_BINARY_NAME}"))
+}
+
+def downloadNPFromArtifactory(server, version)
+{
+	def repo = "bins-release-local/com/itrsgroup/geneos"
+	def np_repo = "geneos-netprobe"
+	def np_archiveName = getNPArchiveName(version)
+	def np_location = "${repo}/${np_repo}"
+	def np_rc = checkRCVersion(np_location,version,np_archiveName)
+	
+	return downloadNPandGWBinaries(server, np_location, version, np_rc, np_archiveName)
+}
+
+def downloadGWFromArtifactory(server, version)
+{
+	def repo = "bins-release-local/com/itrsgroup/geneos"
+	def gw_repo = "geneos-gateway2"
+	def gw_location = "${repo}/${gw_repo}"
+	def gw_archiveName = getGWArchiveName(version)
+	def gw_rc = checkRCVersion(gw_location,version,gw_archiveName)
+
+	return downloadNPandGWBinaries(server, gw_location, version, gw_rc, gw_archiveName)
+
+}
+
+def downloadHubFromArtifactory(server, hubVersion, hubArtifact)
+{
+	def repo = "libs-release-local/com/itrsgroup/hub/deploy"
+	def hub_archiveName = getHubArchiveName(hubArtifact, hubVersion).trim()
+
+	println ("Got the hub_arhiveName =  ${hub_archiveName}");
+	
+	return downloadHubBinaries(server,repo,hub_archiveName)
+	
+}
+
+
+def downloadATSFromArtifactory(server, version)
+{
+	def repo_ats = "geneos-snapshots-local"
+	def ats_repo = "ats"
+	def ats_archiveName = getATSArchiveName(version)
+	def ats_location = "${repo_ats}/${ats_repo}"
+
+	return downloadATSBinaries(server, ats_location, version, ats_archiveName)
+}
+
+def downloadNPandGWBinaries(server, directory, version, rcNumber, archiveName)
+{
+	def downloadBinaries = 
+	"""{
+ 		"files": [
+ 		 {
+     		 "pattern": "${directory}/GA${version}-${rcNumber}/${archiveName}",
+      		 "target": "${NODE_WORKSPACE}/",
+      		 "flat": "true"   		     		
+    		}
+ 				 ]
+		}"""
+
+	def downloadFiles = server.download spec: downloadBinaries
+
+	def binary = findFiles(glob: 'geneos-*.zip,geneos-*.tar.gz')
+	return (binary.contains(archiveName))
+}
+
+def downloadHubBinaries(server, directory, archiveName)
+{
+	def downloadBinaries = 
+	"""{
+ 		"files": [
+ 		 {
+     		 "pattern": "${directory}/${archiveName}",
+      		 "target": "${NODE_WORKSPACE}/",
+      		 "flat": "true"   		     		
+    		}
+ 				 ]
+		}"""
+	
+	def downloadFiles = server.download spec: downloadBinaries
+	println("downloadHubBinaries  downloadFiles = ${downloadFiles}");
+
+	def binary = findFiles(glob: 'htk-*.tar.gz,hub-*.tar.gz')
+	return (binary.contains(archiveName))
+}
+
+
+def downloadATSBinaries(server, directory, version, archiveName)
+{
+	def downloadBinaries = 
+	"""{
+ 		"files": [
+ 		 {
+     		 "pattern": "${directory}/GA${version}/${archiveName}",
+      		 "target": "${NODE_WORKSPACE}/",
+      		 "flat": "true"   		     		
+    		}
+ 				 ]
+		}"""
+
+	def downloadFiles = server.download spec: downloadBinaries
+
+	def binary = findFiles(glob: 'geneos-*.zip,geneos-*.tar.gz')
+	return (binary.contains(archiveName))
+}
+
+def extractArtifacts()
+{
+	def archives = findFiles(glob: '*.zip,*.tar.gz')
+
+	archives.each {
+		archive ->
+
+		def isZip = archive.name.endsWith('.zip')
+
+		println("Extracting archive: ${archive.name}...")
+		if (isZip)
+				unzip (zipFile: archive.name)
+		else
+				sh ("tar xvzf ${archive.name}")
+		
+		println("Deleting archive: ${archive.name}...")
+		sh ("rm ${archive.name}")
+	}
+}
+
+def getTestFolders()
+{
+	def Folders = []
+
+	try 
+	{
+		checkoutFolders = sh(script: "cd '${NODE_WORKSPACE}/geneos/Test/' && find . -type d | sed \'s/\\.//g\' | sort | uniq | xargs", returnStdout: true).trim().tokenize(' ')
+	}
+	catch(err)
+	{
+		println("Unable to check folders. " + err.getMessage())
+	}	
+ 
+	return checkoutFolders
+}
+
+def validateCheckoutPaths(featureDirs)
+{
+	def checkoutFolders = getTestFolders()
+
+	featureDirs.eachWithIndex {
+		featureDir, idx ->
+
+		def isFolderPresent = false
+
+		for(String folder in checkoutFolders){
+			if (folder == "/${featureDir}")
+			{
+				isFolderPresent = true
+			}
+		}
+
+		if (isFolderPresent == false)
+		{
+			currentBuild.result = 'ABORTED'
+			error("SOME FEATURE DIRECTORY TO TEST NOT FOUND")
+			deleteDir()
+		}
+    }
+}
+
+def getCheckoutPaths(featureDirs)
+{
+	def checkoutPaths = []
+
+	featureDirs.eachWithIndex {
+	featureDir, idx ->
+
+		checkoutPaths.add("path" : "Test/${featureDir}")
+	}
+
+	checkoutPaths.add("path" : "Source/.build-utils/*")
+	checkoutPaths.add("path" : "Source/version.txt")
+	checkoutPaths.add("path" : "Test/scripts")
+	checkoutPaths.add("path" : "Test/Plugins/Helpers")
+	checkoutPaths.add("path" : "Test/Gateway2/certificates")
+	checkoutPaths.add("path" : "Test/Gateway2/lib")	
+	checkoutPaths.add("path" : "Test/GWHub") 
+
+	return checkoutPaths
+}
+
+def checkoutRepositories(featureDirs)
+{
+	def sparsePaths = getCheckoutPaths(featureDirs)
+
+	checkout([
+		$class: 'GitSCM',
+		branches: [[name: "remotes/origin/${params.BRANCH}"]], 
+		doGenerateSubmoduleConfigurations: false, 
+		extensions: [
+			[$class: 'SparseCheckoutPaths', sparseCheckoutPaths: sparsePaths],
+			[$class: 'CloneOption', depth: 1, noTags: true, reference: '', shallow: true, timeout: 60], 
+			[$class: 'RelativeTargetDirectory', relativeTargetDir: 'geneos'],
+			[$class: 'CleanBeforeCheckout'],
+			[$class: 'CleanCheckout'], 
+			[$class: 'LocalBranch', localBranch: "i${BUILD_NUMBER}"], 
+			[$class: 'CheckoutOption', timeout: 21]
+		],
+		submoduleCfg: [], 
+		userRemoteConfigs: [
+		[credentialsId: params.GIT_CREDENTIALS_ID, url: params.GIT_URL]
+		]
+	])
+}
+
+def getBuildUser()
+{
+	wrap([$class: 'BuildUser']) {
+		if (env.BUILD_USER_ID?.trim()) {
+			return env.BUILD_USER_ID.substring(env.BUILD_USER_ID.indexOf("\\")+1)
+		}
+		return "auto-jenkins"		
+	}
+}
+
+def getUniqueWorkspace()
+{
+	if (isUnix())
+		return "${WORKSPACE}/${BUILD_USER_ID}/${BUILD_NUMBER}"
+
+	return "${WORKSPACE}\\${BUILD_USER_ID}\\${BUILD_NUMBER}"
+}
+
+def getWorkspace()
+{
+	if (params.UNIQUE_WORKSPACE == true)
+		return getUniqueWorkspace()
+
+	return "${WORKSPACE}"
+}
+
+def getFeatureDirsToTest()
+{
+	return params.FEATURE_DIRS_TO_TEST.tokenize(',')
+}
+
+def getTestArea(featureDir)
+{
+	def featureDirName = featureDir.replace("/", "-");
+
+	if (IS_REMOTE_MACHINE)
+	{
+		def stepBack = ""
+
+		featureDir.tokenize("/").each{
+			stepBack += "../"
+		}
+
+		return "../../${stepBack}${featureDirName}_${BUILD_NUMBER}_testarea"
+	}
+
+	return "${NODE_WORKSPACE}/${featureDirName}_${BUILD_NUMBER}_testarea"
+}
+
+def getRemoteTestPath()
+{
+	def platform = TEST_CONFIG[params.PLATFORM_ID]['np_platform']
+	def npRemoteDrive = getRemoteDrive()
+	def remoteTestPath = "${NODE_WORKSPACE}".substring("${NODE_WORKSPACE}".indexOf("${JOB_NAME}")) + "/geneos/Test"
+
+	if (platform.startsWith('windows'))
+		return "${npRemoteDrive}:${remoteTestPath}"
+	else if (platform.startsWith('aix') || platform.startsWith('linuxppc'))
+		return "${npRemoteDrive}/${remoteTestPath}"
+	else
+		return ""
+}
+
+def callRunATS(featureDir, ports)
+{
+	def featureDirName = featureDir.replaceAll("/", "-");
+	def testarea = getTestArea(featureDir)
+	def logDirName = "${featureDirName}_${BUILD_NUMBER}_logs"
+
+	def ENV_TESTAREA = ["ATS_TESTAREA_TEMP=${testarea}"]
+	def ENV_LOGDIR   = ["RUN_LOG_DIR_TEMP=${NODE_WORKSPACE}/${logDirName}"]
+	def ENV_REMOTE_FOLDER = ["NP_REMOTE_FOLDER=${REMOTE_TEST_DIR}/${featureDir}"]
+
+	def GATEWAY_PORT = ports['gw_port']
+	def NETPROBE_PORT = ports['np_port']
+	def GATEWAY_EXPORT_PORT = ports['gwe_port']
+	def ENV_PORTS = ["ATS_NP_PARAMS=${NETPROBE_PORT}", "ATS_GW_PORTS=${GATEWAY_PORT}", "ATS_GWE_PORTS=${GATEWAY_EXPORT_PORT}"]
+
+	println("Ports - GW: ${GATEWAY_PORT} NP: ${NETPROBE_PORT} GWE: ${GATEWAY_EXPORT_PORT}")
+
+	try
+	{
+		withEnv(DEFAULT_ENV_ARRAY + ENV_TESTAREA + ENV_LOGDIR + ENV_REMOTE_FOLDER + ENV_PORTS )
+		{
+			def runScript = 'runATS-rta.sh'
+			def envScript = 'env-rta.sh'
+			def subFeature = featureDir.substring(featureDir.lastIndexOf("/") + 1)
+
+			println("Calling ${runScript} - Started.")
+			sh ("""
+					cd ${TEST_PATH}
+					chmod a+x ./scripts/${runScript}
+
+					if [ -f ../../${logDirName}/runlog.log ]
+					then
+						echo "" > ../../${logDirName}/runlog.log
+					fi
+
+					./scripts/${runScript} ./scripts/${envScript} ${TEST_LIST_NAME} ${featureDir}
+					rc=`grep ERROR ../../${logDirName}/runlog.log | grep '${subFeature}' | wc -l`
+					exit \${rc}
+			""")
+			println("Calling ${runScript} - Completed.")
+		}
+	}
+	catch (err)
+	{
+		println("Exception found in calling runATS : " + err.getMessage())
+		throw err
+	}
+	finally
+	{
+		try
+		{
+			junit allowEmptyResults: true, keepLongStdio: true, testResults: "${logDirName}/*.xunit.xml"
+		}
+		catch (err)
+		{
+			println("Failing tests were found in xunit report: " + err.getMessage());
+			currentBuild.result = 'SUCCESS'
+		}
+		
+		lock ('port-mgmt')
+		{
+			releaseGatewayAndNetprobePorts(GATEWAY_PORT, GATEWAY_EXPORT_PORT, NETPROBE_PORT)
+		}
+	}
+}
+
+def releaseGatewayAndNetprobePorts(gwPorts ,gwePorts, npPorts)
+{
+	def probehost = ''
+
+	if (IS_REMOTE_MACHINE)
+		probehost = DEFAULT_ENV_MAP['NP_REMOTE_HOST']
+	else
+		probehost = getHostname()
+
+	freePorts(getHostname(), gwPorts)
+	freePorts(getHostname(), gwePorts)
+	freePorts(probehost, npPorts)
+}
+
+def freePorts(host, ports)
+{
+	println("Freeing ${ports}")
+	
+	"${ports}".tokenize(',').each {
+		port ->
+
+		def rc = -1
+		def retry = 0
+
+		while(rc != 0 && retry < 3)
+		{
+			rc = freePort(host, port)
+			println("freePort: ${host}:${port} rc = ${rc} retry = ${retry}")	
+			retry++
+		}
+	}
+}
+
+def getHostname()
+{
+	return sh (script: "hostname", returnStdout: true).trim()
+}
+
+def getAvailableLocalPort(basePort)
+{
+	def host = getHostname()
+	def rc = -1
+	def port = 0
+
+	try
+	{
+		for (port = basePort; port <= 65535; port++)
+		{
+			port = sh(returnStdout: true, script: "./geneos/Test/scripts/get-available-port.sh ${port}").trim().toInteger()	
+			rc = reservePort(host, port)
+			println("reservePort: ${host}:${port} rc = ${rc}")	
+			
+			if (rc == 0)
+				break	
+		}
+	}
+	catch(err)
+	{
+		currentBuild.result = 'ABORTED'
+		error("Unable to get available port. " + err.getMessage())
+	}
+
+	return port
+}
+
+def getAvailableRemotePort(basePort)
+{
+	def remoteHost = DEFAULT_ENV_MAP['NP_REMOTE_HOST']
+	def remoteScriptsDir = REMOTE_TEST_DIR + "/scripts"
+	def platform = TEST_CONFIG[params.PLATFORM_ID]['np_platform']
+
+	def portGetterScript = "get-available-port.sh"
+	if (platform.startsWith('windows'))
+		portGetterScript = "get-available-port.bat"
+
+	def rc = -1
+	def port = 0
+
+	try
+	{
+		for (port = basePort; port <= 65535; port++)
+		{
+			port = sh(
+				returnStdout: true,
+				script: "ssh ${remoteHost} ${remoteScriptsDir}/${portGetterScript} ${port} | tr -cd '[:print:]'"
+			).trim().toInteger()	
+			rc = reservePort(remoteHost, port)
+			println("reservePort: ${remoteHost}:${port} rc = ${rc}")	
+
+			if (rc == 0)
+				break	
+		}
+
+	}
+	catch(err)
+	{
+		currentBuild.result = 'ABORTED'
+		error("Unable to get available port. " + err.getMessage())
+	}
+	
+	return port
+}
+
+def getAvailableGatewayPort(basePort)
+{
+	return getAvailableLocalPort(basePort)
+}
+
+def getAvailableNetprobePort(basePort)
+{
+	if (IS_REMOTE_MACHINE)
+		return getAvailableRemotePort(basePort)	
+
+	return getAvailableLocalPort(basePort)
+}
+
+def reservePort(host, port)
+{
+	def escapedJobName = JOB_NAME.replaceAll('/', '_')
+	def result = sh (script: "curl -X POST ${MASTER_IP}:${PORTMAN_PORT}/reserve/${escapedJobName}/${BUILD_NUMBER}/${host}/${port}", returnStdout: true)
+
+	return readJSON(text: result).code
+}
+
+def freePort(host, port)
+{
+	def result = sh (script: "curl -X POST ${MASTER_IP}:${PORTMAN_PORT}/free/${host}/${port}", returnStdout: true)
+	
+	return readJSON(text: result).code
+}
+
+def isPortManagerUp()
+{
+	def result = ''
+
+	try
+	{
+		result = sh (script: "curl -sL -w '%{http_code}' ${MASTER_IP}:${PORTMAN_PORT}/reservations -o /dev/null", returnStdout: true).trim()
+	}
+	catch (err)
+	{
+		println(err.getMessage())
+	}
+	finally 
+	{
+		return result == '200'
+	}
+}
+
+def getGWEPortAssignments(featureDirs, gatewayPort)
+{
+	def exportedGatewayPorts = []
+	def maxExecDuration = 5
+	def expGWPort = gatewayPort + 1
+
+	for (ctr = 0; ctr < 5; ctr++)
+	{
+		timeout(maxExecDuration)
+		{
+			expGWPort = getAvailableGatewayPort(expGWPort)
+		}
+		exportedGatewayPorts.add(expGWPort)
+		expGWPort++
+	}
+	return exportedGatewayPorts
+}
+
+def getPortAssignments(featureDirs)
+{
+	def portAssignments = [:]
+	def maxExecDuration = 5
+
+	lock ('port-mgmt')
+	{
+		def netprobePort = 50320
+		def gatewayPort = 60320
+		def secGWPort = 0
+
+		featureDirs.eachWithIndex {
+			featureDir, idx ->
+
+			def netprobePorts = []
+			def gatewayPorts = []
+			def exportedGatewayPorts = []
+			def probeCount = getMaxProbeCount(featureDir)
+			def gwExpCount = getGatewayExportPorts(featureDir)
+
+			println("Reserving " + probeCount + " netprobe ports...")
+
+			try
+			{
+				for (ctr = 0; ctr < probeCount; ctr++) {
+					timeout(maxExecDuration)
+					{
+						netprobePort = getAvailableNetprobePort(netprobePort)
+					}
+					netprobePorts.add(netprobePort)
+					netprobePort ++
+				}
+
+				for (ctr = 0; ctr < 2; ctr++) {
+					timeout(maxExecDuration)
+					{
+						gatewayPort = getAvailableGatewayPort(gatewayPort)
+					}
+					gatewayPorts.add(gatewayPort)
+					gatewayPort ++
+				}
+
+				if (gwExpCount != 0)
+				{
+					exportedGatewayPorts = getGWEPortAssignments(featureDirs, gatewayPort)
+				}
+
+			}
+			catch(err)
+			{
+				releaseGatewayAndNetprobePorts(gatewayPorts.join(','), exportedGatewayPorts.join(','), netprobePorts.join(','))
+
+				currentBuild.result = 'ABORTED'
+				error("Getting port assignments failed: " + err.getMessage())
+			}
+
+			portAssignments[featureDir] = [
+				'np_port' : netprobePorts.join(','),
+				'gw_port' : gatewayPorts.join(','),
+				'gwe_port' : exportedGatewayPorts.join(',')
+			]
+		}
+	}
+
+	return portAssignments
+}
+
+def getTestRunners(featureDirs, portAssignments)
+{
+	def testRunners = [:]
+
+	featureDirs.eachWithIndex {
+		featureDir, idx ->
+		testRunners[featureDir] = {
+			fetchFeatureDirExternals(featureDir)
+			callRunATS(featureDir, portAssignments[featureDir])
+		}
+	}
+
+	return testRunners
+}
+
+def isRemoteMachine()
+{
+	def platform = TEST_CONFIG[params.PLATFORM_ID]['np_platform']
+
+	if (platform.startsWith('windows') || platform.startsWith('aix') || platform.startsWith('linuxppc'))
+		return true
+
+	return false
+}
+
+def isArtifactsComplete()
+{
+	def checkFolders = sh(script: 'ls -ld netprobe/ ats/ gateway/ | wc -l', returnStdout: true).trim() == '3'
+
+	return checkFolders
+}
+
+def checkRCVersion(binaryPath,version,archiveName)
+{
+	def httpCodeReturn = ""
+	def rcVersion = ""
+	def isSearchingForBinary  = true
+	def rcNum = 1
+	def artifactoryUser = 'geneos-release'
+	def artifactoryAPIKey = 'AKCp5btpMPTegDizGdL32VGtWRGwUb6hBim1mxYwp25aMet54fJd14FFwFVgNvQJfkeYLKD1P'
+	def artifactoryURL = 'https://itrsgroup.jfrog.io/itrsgroup'
+
+	while (isSearchingForBinary && rcNum < 20)
+	{
+		node ('master')
+		{
+			httpCodeReturn = sh(script: "curl -s -o /dev/null -w \"%{http_code}\" ${artifactoryURL}/${binaryPath}/GA${version}-RC${rcNum.toString()}/${archiveName} --user ${artifactoryUser}:${artifactoryAPIKey}", returnStdout: true).trim()
+		}
+
+		if (httpCodeReturn == "200")
+		{
+			rcNum++
+		}
+		else if (httpCodeReturn == "404")
+		{
+			rcNum--
+			rcVersion = "RC${rcNum.toString()}"
+			isSearchingForBinary = false
+			return rcVersion
+		}
+	}
+}
+
+def fallBack()
+{
+	println("Insufficient binaries, downloading from Artifactory")
+
+	def version = getVersion()
+	def hubVersion = getHubVersion()
+	def npArchiveName = getNPArchiveName(version)
+	def gwArchiveName = getGWArchiveName(version)
+	def atsArchiveName = getATSArchiveName(version)
+	//def hubArchiveName = getHubArchiveName(hubVersion,"hub")
+	//def htkArchiveName = getHubArchiveName(hubVersion,"htk")
+	
+	def server_id = '-97573564@1423141328644'
+	def server = Artifactory.server server_id				
+	
+	
+	if( (!fileExists("hub")) && (!fileExists("htk")) && (params.DEPLOY_HUB==true)  )
+	{
+		//println ("Downloading Hub & Htk build: ${hubArchiveName} from Artifactory")
+		//downloadHubFromArtifactory(server, hubVersion, "htk")
+		//downloadHubFromArtifactory(server, hubVersion, "hub")
+	}
+	
+	if(!fileExists("netprobe"))
+	{
+		println ("Downloading Netprobe build: ${npArchiveName} from Artifactory")
+		downloadNPFromArtifactory(server, version)
+	}
+	
+	
+	if(!fileExists("gateway"))
+	{
+		println ("Downloading Gateway build: ${gwArchiveName} from Artifactory")
+		downloadGWFromArtifactory(server, version)
+	}
+	if(!fileExists("ats"))
+	{
+		println ("Downloading ATS build: ${atsArchiveName} from Artifactory")
+		downloadATSFromArtifactory(server, version)
+	}
+	
+	
+	extractArtifacts()
+
+	
+	def isArtifactCompleteFromArtifactory = isArtifactsComplete()
+	
+	if (!isArtifactCompleteFromArtifactory)
+	{
+		println("Insufficient binaries from Pipeline and Artifactory, downloading now from Shared Drive")
+		
+		if(!fileExists("netprobe"))
+		{
+			println ("Downloading Netprobe build: ${npArchiveName} from Shared Drive")
+			downloadNPFromSharedDrive(version)
+		}
+		if(!fileExists("gateway"))
+		{
+			println ("Downloading Gateway build: ${gwArchiveName} from Shared Drive")
+			downloadGWFromSharedDrive(version)
+		}
+		if(!fileExists("ats"))
+		{
+			println ("Downloading ATS build: ${atsArchiveName} from Shared Drive")
+			downloadATSFromSharedDrive(version)
+		}
+
+		extractArtifacts()
+
+		def finalCheck = isArtifactsComplete()
+		
+		if (!finalCheck)
+		{
+			currentBuild.result = 'ABORTED'
+			error('UNABLE TO DOWNLOAD BINARIES FROM BUILD, ARTIFACTORY AND SHARED DRIVE.')
+		}
+	}
+	
+}
+
+def isHubInstanceOnline( )
+{
+
+	println("Checking Hub Instances if online")
+	
+	String[] hub_urls = params.HUB_URL.split(',')
+      
+	for( String hub_url : hub_urls )
+	{
+		def output = sh(returnStdout: true, script: "curl --insecure --header \"Content-Type: application/json\" --request GET https://${hub_url}:${params.HUB_PORT}")
+
+		if ( !output.contains("200"))
+		{
+			currentBuild.result = 'ABORTED'
+			error('HUB INSTANCE IS UNREACHABLE! Check URL : ${hub_url}:${params.HUB_PORT}')
+		}
+	}
+}
+
+node(RUN_NODE)
+{
+	currentBuild.displayName = "PLATFORM: ${params.PLATFORM_ID}"
+	currentBuild.description = "<b>TESTLIST:</b> ${params.TEST_LIST_NAME} <br> <b>FEATURES:</b> ${params.FEATURE_DIRS_TO_TEST}"
+	
+
+	timestamps
+	{
+		IS_REMOTE_MACHINE = isRemoteMachine()
+		BUILD_USER_ID = getBuildUser()
+		FEATURE_DIRS = getFeatureDirsToTest()
+
+		// This is supposed to battle workspace@2...
+		INITIAL_NODE_WORKSPACE = getWorkspace()
+		
+		
+		
+		ws(INITIAL_NODE_WORKSPACE)
+		{
+			NODE_WORKSPACE = pwd()
+			REMOTE_TEST_DIR = getRemoteTestPath()
+
+			stage ("Initialization")
+			{
+				initDefaultEnvironment()
+				//isHubInstanceOnline()
+			}
+
+			stage ('Git Checkout & Fetch Helpers Externals')
+			{
+				checkoutRepositories(FEATURE_DIRS)
+				validateCheckoutPaths(FEATURE_DIRS)
+				fetchHelpersExternals()
+			}
+
+			stage ('Download & Extract Artifacts') 
+			{
+				downloadArtifacts()
+				extractArtifacts()				
+
+				if (!isArtifactsComplete())
+				{			
+					fallBack()
+				}
+			}
+
+			stage ("Execute Tests")
+			{
+				def portAssignments = getPortAssignments(FEATURE_DIRS)
+				def testRunners = getTestRunners(FEATURE_DIRS, portAssignments)				
+
+				try
+				{								
+					parallel testRunners
+					currentBuild.result = 'SUCCESS'
+				}
+				catch (Exception err)
+				{
+					println("Exception raised during parallel execution: " + err.getMessage());
+					currentBuild.result = 'FAILURE'
+				}
+			}
+
+			stage ("Archive")
+			{
+				archiveArtifacts(artifacts: "*_${BUILD_NUMBER}_logs/*", allowEmptyArchive: true)
+			}
+
+			if (params.CLEANUP_WORKSPACE == true)
+			{
+				stage ("Cleanup")
+				{
+					deleteDir()
+				}
+			}
+		}
+	}
+}

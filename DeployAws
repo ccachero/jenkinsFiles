@@ -1,0 +1,224 @@
+def rtServerID = "-97573564@1423141328644"
+def gatewayBin = ""
+def licdBin = ""
+def npLinuxBin = ""
+def Last_Git_Version = ""
+
+pipeline {
+    agent {label 'rhel7'}
+
+    parameters {
+        string(
+          name: 'HUB_VERSION',
+          defaultValue: '1.4.0',
+          description: 'Get the latest Hub Build for the version specified')
+        string(
+          name: 'CLUSTER_NODES',
+          defaultValue: '1',
+          description: 'Number of nodes in the cluster')
+        string(
+          name: 'OWNER',
+          defaultValue: 'email@itrsgroup.com',
+          description: 'owner of the hub instance')
+        choice(name: 'BUILD_TYPE', 
+          choices: 'release\nsnapshot', 
+          description: 'Build configuration for this build.')
+        choice(name: 'ACTION',
+          choices: 'build\ndestroy',
+          description: 'Action to take.')
+    }
+    stages {
+        stage('Determine whether to build or destroy'){
+          when {
+                expression { params.ACTION == 'destroy' }
+            } 
+          steps{
+              script{
+                  hubDestroy()
+                  sh("rm ${WORKSPACE}/htk/terraform/terraform.tfstate")
+              }
+            }
+        }
+        stage('Download Hub and Htk packages'){
+          when {
+                expression { params.ACTION == 'build' }
+            }
+            steps {
+
+              script{
+              println(params.BUILD_TYPE)
+              htkArchivePath = getHubArchiveName("htk", params.HUB_VERSION, params.BUILD_TYPE)
+              hubArchivePath = getHubArchiveName("hub", params.HUB_VERSION, params.BUILD_TYPE)
+            }
+                rtDownload (
+                    serverId: rtServerID,
+                    spec:
+                        """{
+                          "files": [
+                            {
+                              "pattern": "${htkArchivePath}",
+                              "target": "${WORKSPACE}/",
+                              "flat": "true"
+                            }
+                         ]
+                        }"""
+                )
+                rtDownload (
+                    serverId: rtServerID,
+                    spec:
+                        """{
+                          "files": [
+                            {
+                              "pattern": "${hubArchivePath}",
+                              "target": "${WORKSPACE}/",
+                              "flat": "true"
+                            }
+                         ]
+                        }"""
+                )
+            }
+        }
+
+        stage('Untar files')
+        {
+          when {
+                expression { params.ACTION == 'build' }
+            }
+          steps{
+            script{
+              def cluster = params.CLUSTER_NODES
+              def owner = params.OWNER
+
+              untarArchives()
+              def hwValue = (params.HUB_VERSION > "1.4.0") ? "m5.2xlarge" : "functional-testing"
+              writeHubConfig(cluster,owner, hwValue)
+              hubInstall()
+            }
+          }
+        
+      }
+    }
+}
+
+def getHubArchiveName(hubArtifact, hubVersion, buildType)
+{
+  println("Getting Hub Archive Name") 
+  def repo = "libs-${buildType}-local/com/itrsgroup/hub/deploy"
+  def artifactoryURL = "https://itrsgroup.jfrog.io/itrsgroup"
+  def releaseBuilds = ["GA", "RC"]
+  def snapshotBuilds = "snapshot"
+  def binaryBuild = ""
+
+  if(buildType == "release")
+  {
+    for(releaseType in releaseBuilds)
+    {
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'artifactory-id', usernameVariable: 'gitUsername', passwordVariable: 'gitPassword']]){
+        
+        def HUB_BINARY_NAME = sh(returnStdout: true, script: "curl -s -k -u ${gitUsername}:${gitPassword} ${artifactoryURL}/${repo}/?lastModified? | grep -i ${hubArtifact}-${hubVersion}-${releaseType} | tail -1 | sed -e :a -e 's/<[^>]*>//g;/</N;//ba' -e 's/\\.gz.*/.gz/'")
+
+        if(HUB_BINARY_NAME.trim() != "")
+        {
+            binaryBuild = repo + "/" + HUB_BINARY_NAME.trim()
+
+        }
+      }
+    }
+  }
+  else
+  {
+      withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'artifactory-id', usernameVariable: 'gitUsername', passwordVariable: 'gitPassword']]){
+        
+        def HUB_BINARY_NAME = sh(returnStdout: true, script: "curl -s -k -u ${gitUsername}:${gitPassword} ${artifactoryURL}/${repo}/?lastModified? | grep -i ${hubArtifact}-${hubVersion}-${snapshotBuilds} | tail -1 | sed -e :a -e 's/<[^>]*>//g;/</N;//ba' -e 's/\\.gz.*/.gz/'")
+
+        if(HUB_BINARY_NAME.trim() != "")
+        {
+
+          binaryBuild = repo + "/" + HUB_BINARY_NAME.trim()
+        }
+      }
+  }
+  return binaryBuild
+}
+
+def untarArchives()
+{
+  def archives = findFiles(glob: '*.tar.gz')
+
+  archives.each {
+    archive ->
+
+      println("Extracting archive: ${archive.name}...")
+      sh ("tar xvzf ${archive.name}")
+    
+    println("Deleting archive: ${archive.name}...")
+    sh ("rm ${archive.name}")
+  }
+}
+
+def writeHubConfig(cluster, owner, hwValue)
+{
+  def json = """{
+        "hosts_file" :"${WORKSPACE}/hosts",
+
+        "authentication" : {
+            "useFirstHost": true
+        },
+
+        "connection" : {
+            "user": "ec2-user",
+            "private_key" : "${WORKSPACE}/.ssh/ITRS_GH_QA.pem"
+        },
+
+        "aws": {
+            "term": "N/A",
+            "hw_value": "${hwValue}",
+            "cluster_nodes": ${cluster},
+            "aws_region": "ap-southeast-2",
+            "owner": "${owner}",
+            "env_name": "GH Functional Testing",
+            "usage": "Test"
+            "tags": {
+                 "environment": "Test",
+                 "name": "Manila QA",
+                 "purpose": "QA testing",
+                 "department": "Eng",
+                 "team": "QA",
+                 "owner": "${owner}",
+            "env_name": "GH Functional Testing",
+            "usage": "Test"
+                }
+            },
+
+        "hub" : {
+            "user" : "hub",
+            "install" : {
+                "mapr_disks" : [
+                    "/dev/nvme1n1"
+                ]
+            },
+            "ssl": {
+                "key_store": "${WORKSPACE}/.ssh/ssl_keystore",
+                "trust_store": "${WORKSPACE}/.ssh/ssl_truststore",
+                "use_default_passwd": true
+            },
+            "licence" : "${WORKSPACE}/.ssh/licence.txt"
+        },
+         "verbosity" : 0
+      }"""
+
+    writeFile(file:'hub.json', text: json)
+}
+
+def hubInstall()
+{
+  sh './htk/htk aws create ${WORKSPACE}/hub.json'
+  sh './htk/htk hub provision ${WORKSPACE}/hub.json'
+  sh './hub/hubctl setup install ${WORKSPACE}/hub.json'
+  sh './hub/hubctl setup ssl ${WORKSPACE}/hub.json --auto-approve'
+  sh './hub/hubctl setup licence ${WORKSPACE}/hub.json'
+}
+
+def hubDestroy(){
+  sh './htk/htk aws destroy'
+}
